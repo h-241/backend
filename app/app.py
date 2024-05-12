@@ -1,54 +1,25 @@
-from __future__ import annotations
-
 import time
-from typing import Annotated, Literal, Optional
-from uuid import uuid4
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
+from typing import Annotated, AsyncGenerator, ClassVar, Literal
 
-import os
-from fastapi import UploadFile, File
-from uuid import uuid4
-from fastapi.responses import FileResponse
-from sqlalchemy.orm import declarative_base
-from pydantic import BaseModel, Field
-from fastapi_users import FastAPIUsers
-# from fastapi_users.authentication import JWTAuthentication
-from fastapi_users.db import SQLAlchemyBaseUserTable
-from sqlalchemy import Column, String, create_engine
-from sqlalchemy import Column, Integer, String, Boolean, LargeBinary, ForeignKey, func
-from sqlalchemy.orm import relationship, Session
+from fastapi import Depends
+from fastapi_users.db import SQLAlchemyBaseUserTableUUID, SQLAlchemyUserDatabase
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey
 from sqlalchemy.ext.hybrid import hybrid_property
-import stripe
-
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
-
-stripe.api_key = os.getenv("STRIPE_API_KEY")
-JWT_SECRET = os.getenv("JWT_SECRET")
-
-app = FastAPI()
-
-stripe.api_key = "your_stripe_api_key"
-
-engine = create_engine("sqlite:///./database.db")
-Base = declarative_base()
+from sqlalchemy.orm import relationship
 
 
-def get_db():
-    db = Session(engine)
-    try:
-        yield db
-    finally:
-        db.close()
+DATABASE_URL = "sqlite+aiosqlite:///./test.db"
 
 
-class UserTable(Base, SQLAlchemyBaseUserTable):
-    id = Column(Integer, primary_key=True)  # Ensure there is a primary key column
+class Base(DeclarativeBase):
+    id = Column(Integer, primary_key=True, index=True)
+    ID: ClassVar[int] = int
 
-
-class User(Base):
+class User(SQLAlchemyBaseUserTableUUID, Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -70,7 +41,6 @@ class User(Base):
     executed_tasks = relationship(
         "Task", back_populates="executed_by", foreign_keys="Task.executed_by_id"
     )
-
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -122,19 +92,6 @@ class Message(Base):
 
     task = relationship("Task", back_populates="messages")
 
-
-class UserRead(BaseModel):
-    id: int
-    display_name: str
-
-class UserCreate(BaseModel):
-    display_name: str
-
-
-class UserUpdate(BaseModel):
-    display_name: Optional[str]
-
-
 class TaskCreate(BaseModel):
     description: str
     max_price: int
@@ -150,75 +107,145 @@ class TaskQuery(BaseModel):
     requested_by_id: Optional[int]
     executed_by_id: Optional[int]
 
+engine = create_async_engine(DATABASE_URL)
+async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 
-user_db = SQLAlchemyUserDatabase(UserTable, session_factory=get_db)
-jwt_authentication = JWTAuthentication(secret=JWT_SECRET, lifetime_seconds=3600)
 
-fastapi_users = FastAPIUsers(
-    user_db,
-    [jwt_authentication],
-    User,
-    UserCreate,
-    UserUpdate,
-    UserRead,
+async def create_db_and_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
+    async with async_session_maker() as session:
+        yield session
+
+
+async def get_user_db(session: AsyncSession = Depends(get_async_session)):
+    yield SQLAlchemyUserDatabase(session, User)
+
+import uuid
+
+from fastapi_users import schemas
+
+
+class UserRead(schemas.BaseUser[uuid.UUID]):
+    pass
+
+
+class UserCreate(schemas.BaseUserCreate):
+    pass
+
+
+class UserUpdate(schemas.BaseUserUpdate):
+    pass
+
+import uuid
+from typing import Optional
+
+from fastapi import Depends, Request
+from fastapi_users import BaseUserManager, FastAPIUsers, UUIDIDMixin
+from fastapi_users.authentication import (
+    AuthenticationBackend,
+    BearerTransport,
+    JWTStrategy,
+)
+from fastapi_users.db import SQLAlchemyUserDatabase
+
+SECRET = "SECRET"
+
+
+class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
+    reset_password_token_secret = SECRET
+    verification_token_secret = SECRET
+
+    async def on_after_register(self, user: User, request: Optional[Request] = None):
+        print(f"User {user.id} has registered.")
+
+    async def on_after_forgot_password(
+        self, user: User, token: str, request: Optional[Request] = None
+    ):
+        print(f"User {user.id} has forgot their password. Reset token: {token}")
+
+    async def on_after_request_verify(
+        self, user: User, token: str, request: Optional[Request] = None
+    ):
+        print(f"Verification requested for user {user.id}. Verification token: {token}")
+
+
+async def get_user_manager(user_db: SQLAlchemyUserDatabase = Depends(get_user_db)):
+    yield UserManager(user_db)
+
+
+bearer_transport = BearerTransport(tokenUrl="auth/jwt/login")
+
+
+def get_jwt_strategy() -> JWTStrategy:
+    return JWTStrategy(secret=SECRET, lifetime_seconds=3600)
+
+
+auth_backend = AuthenticationBackend(
+    name="jwt",
+    transport=bearer_transport,
+    get_strategy=get_jwt_strategy,
 )
 
+fastapi_users = FastAPIUsers[User, uuid.UUID](get_user_manager, [auth_backend])
+
+current_active_user = fastapi_users.current_user(active=True)
+
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI
+
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Not needed if you setup a migration system like Alembic
+    await create_db_and_tables()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
 app.include_router(
-    fastapi_users.get_auth_router(jwt_authentication),
+    fastapi_users.get_auth_router(auth_backend), prefix="/auth/jwt", tags=["auth"]
+)
+app.include_router(
+    fastapi_users.get_register_router(UserRead, UserCreate),
     prefix="/auth",
     tags=["auth"],
 )
 app.include_router(
-    fastapi_users.get_register_router(),
+    fastapi_users.get_reset_password_router(),
     prefix="/auth",
     tags=["auth"],
 )
-
-from fastapi_users.models import BaseUserDB
-
-CurrentUser = Annotated[User, Depends(fastapi_users.current_user(active=True))]
-
-
-@app.post("/users", response_model=int)
-def create_user(
-    create_user_data: UserCreate,
-    user_manager=Depends(fastapi_users.get_user_manager),
-    db: Session = Depends(get_db),
-) -> int:
-    user = user_manager.create(create_user_data, safe=True)
-    db.commit()
-    return user.id
+app.include_router(
+    fastapi_users.get_verify_router(UserRead),
+    prefix="/auth",
+    tags=["auth"],
+)
+app.include_router(
+    fastapi_users.get_users_router(UserRead, UserUpdate),
+    prefix="/users",
+    tags=["users"],
+)
 
 
-@app.put("/users/{user_id}", response_model=int)
-def update_user(
-    user_id: int,
-    update_user_data: UserUpdate,
-    current_user: CurrentUser,
-    db: Session = Depends(get_db),
-) -> int:
-    if current_user.id != user_id:
-        raise HTTPException(
-            status_code=403, detail="You can only update your own profile"
-        )
+@app.get("/authenticated-route")
+async def authenticated_route(user: User = Depends(current_active_user)):
+    return {"message": f"Hello {user.email}!"}
 
-    try:
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+CurrentUser = Annotated[User, Depends(current_active_user)]
 
-        update_data = update_user_data.dict(exclude_unset=True)
-        for key, value in update_data.items():
-            setattr(user, key, value)
 
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        return user.id
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
 
+############# START HERE #############
+
+
+import stripe
 
 @app.post("/tasks", response_model=int)
 def create_task(
