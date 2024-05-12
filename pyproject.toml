@@ -16,6 +16,11 @@ stripe = "^9.6.0"
 fastapi-users = {extras = ["sqlalchemy"], version = "^13.0.0"}
 
 
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.0"
+requests = "^2.31.0"
+poetry-plugin-export = "^1.8.0"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
