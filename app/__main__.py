@@ -4,13 +4,21 @@ import time
 from typing import Annotated, Literal, Optional
 from uuid import uuid4
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
+
+import os
+from fastapi import UploadFile, File
+from uuid import uuid4
+from fastapi.responses import FileResponse
+
 from pydantic import BaseModel, Field
+from fastapi_users import FastAPIUsers, SQLAlchemyUserDatabase
+from fastapi_users.authentication import JWTAuthentication
+from fastapi_users.db import SQLAlchemyBaseUserTable
+from sqlalchemy import Column, String
 from sqlalchemy import Column, Integer, String, Boolean, LargeBinary, ForeignKey, func
 from sqlalchemy.orm import relationship, Session
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.hybrid import hybrid_property
-from sqlalchemy import create_engine
-import boto3
 import stripe
 
 from dotenv import load_dotenv
@@ -22,7 +30,7 @@ stripe.api_key = os.getenv("STRIPE_API_KEY")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-
+JWT_SECRET = os.getenv("JWT_SECRET")
 
 app = FastAPI()
 
@@ -38,12 +46,17 @@ def get_db():
     finally:
         db.close()
 
+class UserTable(Base, SQLAlchemyBaseUserTable):
+    pass
+
 class User(Base):
     __tablename__ = "users"
     
     id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    
     display_name = Column(String, index=True)
-    identity = Column(String, unique=True, index=True)
     created_at = Column(Integer, default=time.time_ns)
     
     banned = Column(Boolean, default=False)
@@ -103,7 +116,6 @@ class Message(Base):
 # Added for thoroughness, but not used
 class UserCreate(BaseModel):
     display_name: str
-    identity: str
 
 # Added for thoroughness, but not used
 class UserUpdate(BaseModel):
@@ -126,25 +138,39 @@ class TaskQuery(BaseModel):
     requested_by_id: Optional[int]
     executed_by_id: Optional[int]
 
-CurrentUser = Annotated[User, Depends(get_current_user)]
+user_db = SQLAlchemyUserDatabase(UserTable, session_factory=get_db)
 
-def get_current_user(identity: str, db: Session = Depends(get_db)) -> User:
-    user = db.query(User).filter(User.identity == identity).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
+jwt_authentication = JWTAuthentication(secret=JWT_SECRET, lifetime_seconds=3600)
+
+fastapi_users = FastAPIUsers(
+    user_db,
+    [jwt_authentication],
+    User,
+    UserCreate,
+    UserUpdate,
+    UserDB,
+)
+
+app.include_router(
+    fastapi_users.get_auth_router(jwt_authentication),
+    prefix="/auth",
+    tags=["auth"],
+)
+app.include_router(
+    fastapi_users.get_register_router(),
+    prefix="/auth",
+    tags=["auth"],
+)
+
+from fastapi_users.authentication import Authenticated
+
+CurrentUser = Annotated[User, Depends(Authenticated(fastapi_users.current_user))]
 
 @app.post("/users", response_model=int)
-def create_user(create_user_data: UserCreate, db: Session = Depends(get_db)) -> int:
-    try:
-        user = User(**create_user_data.dict())
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        return user.id
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+def create_user(create_user_data: UserCreate, user_manager = Depends(fastapi_users.get_user_manager), db: Session = Depends(get_db)) -> int:
+    user = user_manager.create(create_user_data, safe=True)
+    db.commit()
+    return user.id
 
 @app.put("/users/{user_id}", response_model=int)
 def update_user(user_id: int, update_user_data: UserUpdate, current_user: CurrentUser, db: Session = Depends(get_db)) -> int:
@@ -249,6 +275,7 @@ def add_text_message_to_task(task_id: int, text_content: str, current_user: Curr
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/tasks/{task_id}/messages/image", response_model=int)
 def add_image_message_to_task(task_id: int, image: UploadFile = File(...), current_user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db)) -> int:
     try:
@@ -260,14 +287,19 @@ def add_image_message_to_task(task_id: int, image: UploadFile = File(...), curre
         if current_user.id != task.requested_by_id and current_user.id != task.executed_by_id:
             raise HTTPException(status_code=403, detail="You are not authorized to add messages to this task")
         
-        # Upload image to S3 and get the URL
-        s3 = boto3.client("s3")
-        bucket_name = S3_BUCKET_NAME
-        object_name = f"task_{task_id}_message_{uuid4()}.jpg"
-        s3.upload_fileobj(image.file, bucket_name, object_name)
-        image_url = f"https://{bucket_name}.s3.amazonaws.com/{object_name}"
+        # Save the uploaded image to the public folder
+        public_folder = "public"
+        if not os.path.exists(public_folder):
+            os.makedirs(public_folder)
         
-        message = Message(task_id=task_id, sender_id=current_user.id, image_url=image_url)
+        file_extension = os.path.splitext(image.filename)[1]
+        unique_filename = f"{uuid4()}{file_extension}"
+        file_path = os.path.join(public_folder, unique_filename)
+        
+        with open(file_path, "wb") as file:
+            file.write(image.file.read())
+        
+        message = Message(task_id=task_id, sender_id=current_user.id, image_url=f"/images/{unique_filename}")
         db.add(message)
         db.commit()
         db.refresh(message)
@@ -275,6 +307,13 @@ def add_image_message_to_task(task_id: int, image: UploadFile = File(...), curre
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/images/{filename}")
+async def get_image(filename: str):
+    file_path = os.path.join("public", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(file_path)
 
 @app.get("/tasks/{task_id}/messages", response_model=list[Message])
 def get_messages_for_task(task_id: int, current_user: CurrentUser, db: Session = Depends(get_db), start: int = 0, end: int = None) -> list[Message]:
@@ -379,6 +418,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=lambda: check_expired_tasks(next(get_db())), trigger="interval", minutes=1)
 scheduler.start()
+
+
+
 
 Base.metadata.create_all(bind=engine)
 

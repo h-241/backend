@@ -8,14 +8,12 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.11"
 pydantic = "^2.7.1"
-kybra = "^0.6.0"
 fastapi = "^0.111.0"
 uvicorn = "^0.29.0"
 sqlalchemy = "^2.0.30"
 apscheduler = "^3.10.4"
-boto3 = "^1.34.103"
 stripe = "^9.6.0"
-psycopg2-binary = "^2.9.9"
+fastapi-users = {extras = ["sqlalchemy"], version = "^13.0.0"}
 
 
 [build-system]
