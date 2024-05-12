@@ -1,7 +1,0 @@
-aws_region            = "us-west-2"
-s3_bucket_name        = "my-fastapi-app-images"
-db_username           = "myuser"
-db_password           = "mypassword"
-stripe_api_key        = "your_stripe_api_key"
-aws_access_key_id     = "your_aws_access_key_id"
-aws_secret_access_key = "your_aws_secret_access_key"
