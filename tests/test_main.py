@@ -1,5 +1,5 @@
 from fastapi.testclient import TestClient
-from app.__main__ import app, get_db, User, Task, Message
+from app.main5 import app, get_db, User, Task, Message
 
 client = TestClient(app)
 

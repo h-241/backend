@@ -1,45 +1,54 @@
-import os
+from __future__ import annotations
+
 import time
-from typing import Annotated, AsyncGenerator, ClassVar, Literal, Optional
+from typing import Annotated, Literal, Optional
+from uuid import uuid4
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 
-from fastapi import Depends, File, HTTPException, UploadFile
+import os
+from fastapi import UploadFile, File
+from uuid import uuid4
 from fastapi.responses import FileResponse
-from fastapi_users.db import SQLAlchemyBaseUserTableUUID, SQLAlchemyUserDatabase
-from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, select
+from sqlalchemy.orm import declarative_base
+from pydantic import BaseModel, Field
+from fastapi_users import FastAPIUsers
+# from fastapi_users.authentication import JWTAuthentication
+from fastapi_users.db import SQLAlchemyBaseUserTable
+from sqlalchemy import Column, String, create_engine
+from sqlalchemy import Column, Integer, String, Boolean, LargeBinary, ForeignKey, func
+from sqlalchemy.orm import relationship, Session
 from sqlalchemy.ext.hybrid import hybrid_property
-from sqlalchemy.orm import relationship
-from contextlib import asynccontextmanager
+import stripe
 
-from sqlmodel import SQLModel, Field
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
 
-@asynccontextmanager
-async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session_maker() as session:
-        try:
-            yield session
-            await session.commit()
-        except:
-            await session.rollback()
-            raise
+stripe.api_key = os.getenv("STRIPE_API_KEY")
+JWT_SECRET = os.getenv("JWT_SECRET")
 
+app = FastAPI()
 
-DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+stripe.api_key = "your_stripe_api_key"
+
+engine = create_engine("sqlite:///./database.db")
+Base = declarative_base()
 
 
-class Base(DeclarativeBase):
-    id = Column(Integer, primary_key=True, index=True)
-    ID: ClassVar[int] = int
+def get_db():
+    db = Session(engine)
+    try:
+        yield db
+    finally:
+        db.close()
 
 
-class UserSQLBase(SQLAlchemyBaseUserTableUUID, Base):
-    pass
+class UserTable(Base, SQLAlchemyBaseUserTable):
+    id = Column(Integer, primary_key=True)  # Ensure there is a primary key column
 
 
-class User(SQLModel, table=True):
+class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -114,6 +123,18 @@ class Message(Base):
     task = relationship("Task", back_populates="messages")
 
 
+class UserRead(BaseModel):
+    id: int
+    display_name: str
+
+class UserCreate(BaseModel):
+    display_name: str
+
+
+class UserUpdate(BaseModel):
+    display_name: Optional[str]
+
+
 class TaskCreate(BaseModel):
     description: str
     max_price: int
@@ -130,153 +151,80 @@ class TaskQuery(BaseModel):
     executed_by_id: Optional[int]
 
 
-engine = create_async_engine(DATABASE_URL)
-async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+user_db = SQLAlchemyUserDatabase(UserTable, session_factory=get_db)
+jwt_authentication = JWTAuthentication(secret=JWT_SECRET, lifetime_seconds=3600)
 
-
-async def create_db_and_tables():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
-async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session_maker() as session:
-        yield session
-
-
-async def get_user_db(session: AsyncSession = Depends(get_async_session)):
-    yield SQLAlchemyUserDatabase(session, User)
-
-
-import uuid
-
-from fastapi_users import schemas
-
-
-class UserRead(schemas.BaseUser[uuid.UUID]):
-    pass
-
-
-class UserCreate(schemas.BaseUserCreate):
-    pass
-
-
-class UserUpdate(schemas.BaseUserUpdate):
-    pass
-
-
-import uuid
-from typing import Optional
-
-from fastapi import Depends, Request
-from fastapi_users import BaseUserManager, FastAPIUsers, UUIDIDMixin
-from fastapi_users.authentication import (
-    AuthenticationBackend,
-    BearerTransport,
-    JWTStrategy,
+fastapi_users = FastAPIUsers(
+    user_db,
+    [jwt_authentication],
+    User,
+    UserCreate,
+    UserUpdate,
+    UserRead,
 )
-from fastapi_users.db import SQLAlchemyUserDatabase
-
-SECRET = "SECRET"
-
-
-class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
-    reset_password_token_secret = SECRET
-    verification_token_secret = SECRET
-
-    async def on_after_register(self, user: User, request: Optional[Request] = None):
-        print(f"User {user.id} has registered.")
-
-    async def on_after_forgot_password(
-        self, user: User, token: str, request: Optional[Request] = None
-    ):
-        print(f"User {user.id} has forgot their password. Reset token: {token}")
-
-    async def on_after_request_verify(
-        self, user: User, token: str, request: Optional[Request] = None
-    ):
-        print(f"Verification requested for user {user.id}. Verification token: {token}")
-
-
-async def get_user_manager(user_db: SQLAlchemyUserDatabase = Depends(get_user_db)):
-    yield UserManager(user_db)
-
-
-bearer_transport = BearerTransport(tokenUrl="auth/jwt/login")
-
-
-def get_jwt_strategy() -> JWTStrategy:
-    return JWTStrategy(secret=SECRET, lifetime_seconds=3600)
-
-
-auth_backend = AuthenticationBackend(
-    name="jwt",
-    transport=bearer_transport,
-    get_strategy=get_jwt_strategy,
-)
-
-fastapi_users = FastAPIUsers[User, uuid.UUID](get_user_manager, [auth_backend])
-
-current_active_user = fastapi_users.current_user(active=True)
-
-from contextlib import asynccontextmanager
-
-from fastapi import Depends, FastAPI
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Not needed if you setup a migration system like Alembic
-    await create_db_and_tables()
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
 
 app.include_router(
-    fastapi_users.get_auth_router(auth_backend), prefix="/auth/jwt", tags=["auth"]
-)
-app.include_router(
-    fastapi_users.get_register_router(UserRead, UserCreate),
+    fastapi_users.get_auth_router(jwt_authentication),
     prefix="/auth",
     tags=["auth"],
 )
 app.include_router(
-    fastapi_users.get_reset_password_router(),
+    fastapi_users.get_register_router(),
     prefix="/auth",
     tags=["auth"],
 )
-app.include_router(
-    fastapi_users.get_verify_router(UserRead),
-    prefix="/auth",
-    tags=["auth"],
-)
-app.include_router(
-    fastapi_users.get_users_router(UserRead, UserUpdate),
-    prefix="/users",
-    tags=["users"],
-)
+
+from fastapi_users.models import BaseUserDB
+
+CurrentUser = Annotated[User, Depends(fastapi_users.current_user(active=True))]
 
 
-@app.get("/authenticated-route")
-async def authenticated_route(user: User = Depends(current_active_user)):
-    return {"message": f"Hello {user.email}!"}
+@app.post("/users", response_model=int)
+def create_user(
+    create_user_data: UserCreate,
+    user_manager=Depends(fastapi_users.get_user_manager),
+    db: Session = Depends(get_db),
+) -> int:
+    user = user_manager.create(create_user_data, safe=True)
+    db.commit()
+    return user.id
 
 
-CurrentUser = Annotated[User, Depends(current_active_user)]
+@app.put("/users/{user_id}", response_model=int)
+def update_user(
+    user_id: int,
+    update_user_data: UserUpdate,
+    current_user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> int:
+    if current_user.id != user_id:
+        raise HTTPException(
+            status_code=403, detail="You can only update your own profile"
+        )
 
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
 
-############# START HERE #############
+        update_data = update_user_data.dict(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(user, key, value)
 
-
-import stripe
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return user.id
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/tasks", response_model=int)
 def create_task(
     create_task_data: TaskCreate,
     current_user: CurrentUser,
-    db: AsyncSession = Depends(get_async_session),
+    db: Session = Depends(get_db),
 ) -> int:
     try:
         task = Task(**create_task_data.dict(), requested_by_id=current_user.id)
@@ -293,7 +241,7 @@ def create_task(
 def get_available_tasks(
     query: TaskQuery = Depends(),
     current_user: CurrentUser = Depends(fastapi_users.current_user(active=True)),
-    db: AsyncSession = Depends(get_async_session),
+    db: Session = Depends(get_db),
     skip: int = 0,
     limit: int = 100,
 ) -> list[Task]:
@@ -340,9 +288,7 @@ def get_available_tasks(
 
 @app.put("/tasks/{task_id}/accept", response_model=int)
 def accept_task(
-    task_id: int,
-    current_user: CurrentUser,
-    db: AsyncSession = Depends(get_async_session),
+    task_id: int, current_user: CurrentUser, db: Session = Depends(get_db)
 ) -> int:
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
@@ -376,7 +322,7 @@ def add_text_message_to_task(
     task_id: int,
     text_content: str,
     current_user: CurrentUser,
-    db: AsyncSession = Depends(get_async_session),
+    db: Session = Depends(get_db),
 ) -> int:
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
@@ -408,7 +354,7 @@ def add_image_message_to_task(
     task_id: int,
     image: UploadFile = File(...),
     current_user: CurrentUser = Depends(fastapi_users.current_user(active=True)),
-    db: AsyncSession = Depends(get_async_session),
+    db: Session = Depends(get_db),
 ) -> int:
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
@@ -431,7 +377,7 @@ def add_image_message_to_task(
             os.makedirs(public_folder)
 
         file_extension = os.path.splitext(image.filename)[1]
-        unique_filename = f"{uuid.uuid4()}{file_extension}"
+        unique_filename = f"{uuid4()}{file_extension}"
         file_path = os.path.join(public_folder, unique_filename)
 
         with open(file_path, "wb") as file:
@@ -463,7 +409,7 @@ async def get_image(filename: str):
 def get_messages_for_task(
     task_id: int,
     current_user: CurrentUser,
-    db: AsyncSession = Depends(get_async_session),
+    db: Session = Depends(get_db),
     start: int = 0,
     end: int = None,
 ) -> list[Message]:
@@ -494,9 +440,7 @@ def get_messages_for_task(
 
 @app.put("/tasks/{task_id}/cancel", response_model=int)
 def cancel_task(
-    task_id: int,
-    current_user: CurrentUser,
-    db: AsyncSession = Depends(get_async_session),
+    task_id: int, current_user: CurrentUser, db: Session = Depends(get_db)
 ) -> int:
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
@@ -522,9 +466,7 @@ def cancel_task(
 
 @app.put("/tasks/{task_id}/complete", response_model=int)
 def complete_task(
-    task_id: int,
-    current_user: CurrentUser,
-    db: AsyncSession = Depends(get_async_session),
+    task_id: int, current_user: CurrentUser, db: Session = Depends(get_db)
 ) -> int:
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
@@ -566,20 +508,15 @@ def complete_task(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def check_expired_tasks(db: AsyncSession):
+def check_expired_tasks(db: Session):
     try:
         now = time.time_ns()
         expired_tasks = (
-            (
-                await db.execute(
-                    select(Task).where(
-                        Task.status == "accepted",
-                        Task.accepted_time_ns + Task.completion_expiration_duration
-                        < now,
-                    )
-                )
+            db.query(Task)
+            .filter(
+                Task.status == "accepted",
+                Task.accepted_time_ns + Task.completion_expiration_duration < now,
             )
-            .scalars()
             .all()
         )
 
@@ -587,9 +524,9 @@ async def check_expired_tasks(db: AsyncSession):
             task.canceled_time_ns = now
             db.add(task)
 
-        await db.commit()
+        db.commit()
     except Exception as e:
-        await db.rollback()
+        db.rollback()
         print(f"Error checking expired tasks: {str(e)}")
 
 
@@ -598,12 +535,13 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(
-    func=lambda: check_expired_tasks(next(get_async_session())),
-    trigger="interval",
-    minutes=1,
+    func=lambda: check_expired_tasks(next(get_db())), trigger="interval", minutes=1
 )
 scheduler.start()
 
 Base.metadata.create_all(bind=engine)
 
-# call uvicorn app:app --reload
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
