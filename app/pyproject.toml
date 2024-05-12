@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "contract"
+name = "app"
 version = "0.1.0"
 description = ""
 authors = ["Jacob Valdez <jacobfv123@gmail.com>"]
