@@ -16,6 +16,7 @@ stripe = "^9.6.0"
 fastapi-users = {extras = ["sqlalchemy"], version = "^13.0.0"}
 aiosqlite = "^0.20.0"
 sqlmodel = "^0.0.18"
+email-validator = "^2.1.1"
 
 
 [tool.poetry.group.dev.dependencies]
